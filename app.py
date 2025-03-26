@@ -1,5 +1,7 @@
 from flask import Flask, request, jsonify
 from minio import Minio
+from dotenv import load_dotenv
+import fitz  # PyMuPDF
 import os
 
 # Charger les variables d'environnement depuis le fichier .env
@@ -19,6 +21,17 @@ minio_client = Minio(
     secret_key=MINIO_SECRET_KEY,
     secure=False  # Désactiver SSL pour un usage local
 )
+
+#extraction des fichiers pdf 
+def extract_text_from_pdf(pdf_file_path):
+    doc = fitz.open(pdf_file_path)  # Ouvrir le fichier PDF
+    text = ""
+    
+    for page_num in range(doc.page_count):  # Parcourir chaque page du PDF
+        page = doc.load_page(page_num)  # Charger la page
+        text += page.get_text()  # Extraire le texte de la page
+    
+    return text
 
 @app.route("/upload", methods=["POST"])
 def upload_cv():
@@ -41,6 +54,8 @@ def upload_cv():
         return jsonify({"message": f"Fichier {file_name} uploadé avec succès"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
+
 
 if __name__ == "__main__":
     app.run(debug=True)

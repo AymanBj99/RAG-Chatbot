@@ -1,0 +1,5 @@
+flask
+minio
+python-dotenv
+pymupdf
+load_dotenv
