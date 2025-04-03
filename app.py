@@ -1,75 +1,94 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-import PyPDF2
+import ollama
 import os
-from dotenv import load_dotenv  # Charger .env
-
-# Charger les variables d'environnement
-load_dotenv()
+import numpy as np
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+from sentence_transformers import SentenceTransformer
+from utils import extract_text_from_pdf
+from qdrant_setup import create_collection
 
 app = Flask(__name__)
+CORS(app)
 
-# Configuration CORS
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000")
-CORS(app, resources={r"/*": {"origins": CORS_ORIGINS}})
-
-# Initialisation du modèle d'embedding
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-# Configuration du dossier d'upload
-UPLOAD_FOLDER = os.getenv("UPLOAD_FOLDER", "uploads")
+UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Charger le modèle d'embedding
+embedder = SentenceTransformer("all-mpnet-base-v2")
+
 # Connexion à Qdrant
-client = QdrantClient(host=os.getenv("QDRANT_HOST", "localhost"), port=int(os.getenv("QDRANT_PORT", 6333)))
+client = QdrantClient("localhost", port=6333)
 
-COLLECTION_NAME = "resumes"
-try:
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=models.VectorParams(size=384, distance=models.Distance.COSINE),
-    )
-except Exception as e:
-    print(f"Collection already exists or error: {e}")
+@app.route("/api/hello")
+def hello():
+    return {"message": "Hello from Flask!"}
 
-def extract_text_from_pdf(pdf_path):
-    with open(pdf_path, "rb") as file:
-        pdf_reader = PyPDF2.PdfReader(file)
-        return " ".join(page.extract_text() or "" for page in pdf_reader.pages)
+@app.route("/")
+def home():
+    return "Bienvenue sur l'API de filtrage de CVs !"
 
 @app.route("/upload", methods=["POST"])
-def upload_pdf():
-    try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
+def upload_cv():
+    """Upload un CV et stocke son embedding dans Qdrant"""
+    if "file" not in request.files:
+        return jsonify({"error": "Aucun fichier reçu"}), 400
 
-        file = request.files["file"]
-        if file.filename == "":
-            return jsonify({"error": "Empty filename"}), 400
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Fichier invalide"}), 400
 
-        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
-        file.save(filepath)
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    file.save(file_path)
 
-        text = extract_text_from_pdf(filepath)
-        if not text.strip():
-            return jsonify({"error": "No text extracted from PDF"}), 400
+    # Extraction du texte
+    text = extract_text_from_pdf(file_path)
+    embedding = embedder.encode(text).tolist()
 
-        embedding = embedding_model.encode(text).tolist()
-        resume_id = hash(file.filename) % (10**6)
-        client.upsert(
-            collection_name=COLLECTION_NAME,
-            points=[models.PointStruct(id=resume_id, vector=embedding, payload={"text": text})]
-        )
+    # Stockage dans Qdrant
+    client.upsert(
+        collection_name="cvs",
+        points=[PointStruct(id=hash(file.filename), vector=embedding, payload={"filename": file.filename, "text": text})]
+    )
 
-        return jsonify({"message": "Resume stored successfully", "text": text})
+    return jsonify({"message": "CV enregistré avec succès"}), 200
 
-    except Exception as e:
-        print(f"Error processing upload: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+@app.route("/search", methods=["POST"])
+def search_cv():
+    """Recherche les CVs les plus pertinents en fonction d'une requête"""
+    data = request.json
+    query = data.get("query", "")
+
+    if not query:
+        return jsonify({"error": "Requête vide"}), 400
+
+    query_vector = embedder.encode(query).tolist()
+    search_results = client.search(collection_name="cvs", query_vector=query_vector, limit=5)
+
+    results = [{"filename": res.payload["filename"], "text": res.payload["text"]} for res in search_results]
+    return jsonify(results), 200
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    """Chatbot qui répond en utilisant RAG et Ollama"""
+    data = request.json
+    query = data.get("query", "")
+
+    if not query:
+        return jsonify({"error": "Requête vide"}), 400
+
+    query_vector = embedder.encode(query).tolist()
+    search_results = client.search(collection_name="cvs", query_vector=query_vector, limit=3)
+
+    context = "\n\n".join([res.payload["text"] for res in search_results])
+    prompt = f"Contexte:\n{context}\n\nQuestion: {query}\nRéponse:"
+
+    response = ollama.chat(model="mistral", messages=[{"role": "user", "content": prompt}])
+    
+    return jsonify({"response": response['message']}), 200
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    create_collection()
+    print("Collection 'cvs' créée avec succès !")
+    app.run(debug=True)
